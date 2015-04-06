@@ -35,6 +35,7 @@ import botocore.session
 import botocore.auth
 import botocore.credentials
 import botocore.vendored.requests as requests
+from botocore.client import Config
 
 
 class BaseS3ClientTest(unittest.TestCase):
@@ -126,11 +127,12 @@ class BaseS3ClientTest(unittest.TestCase):
 class TestS3BaseWithBucket(BaseS3ClientTest):
     def setUp(self):
         super(TestS3BaseWithBucket, self).setUp()
-        self.region = 'us-west-2'
         self.bucket_name = self.create_bucket()
 
 
 class TestS3Buckets(TestS3BaseWithBucket):
+    def setUp(self):
+        super(TestS3Buckets, self).setUp()
 
     def test_can_make_request(self):
         # Basic smoke test to ensure we can talk to s3.
@@ -144,7 +146,7 @@ class TestS3Buckets(TestS3BaseWithBucket):
         result = self.client.get_bucket_location(Bucket=self.bucket_name)
         self.assertIn('LocationConstraint', result)
         # For buckets in us-east-1 (US Classic Region) this will be None
-        self.assertEqual(result['LocationConstraint'], self.region)
+        self.assertEqual(result['LocationConstraint'], None)
 
 
 class TestS3Objects(TestS3BaseWithBucket):
@@ -418,62 +420,224 @@ class TestS3Copy(TestS3BaseWithBucket):
         self.assert_status_code(parsed, 200)
 
 
-# TODO: Convert this test to the presigning function that is to be
-# added later
-@unittest.skip('Need a method for presigning')
-class TestS3Presign(BaseS3ClientTest):
-    def setUp(self):
-        super(TestS3Presign, self).setUp()
-        self.bucket_name = 'botocoretest%s-%s' % (
-            int(time.time()), random.randint(1, 1000))
-
-        operation = self.service.get_operation('CreateBucket')
-        response = operation.call(self.endpoint, bucket=self.bucket_name)
-        self.assertEqual(response[0].status_code, 200)
+class BaseS3PresignTest(BaseS3ClientTest):
 
     def tearDown(self):
         for key in self.keys:
-            operation = self.service.get_operation('DeleteObject')
-            operation.call(self.endpoint, bucket=self.bucket_name,
-                           key=key)
-        self.delete_bucket(self.bucket_name)
-        super(TestS3Presign, self).tearDown()
+            self.client.delete_object(
+                Bucket=self.bucket_name, Key=key)
+        super(BaseS3PresignTest, self).tearDown()
 
-    def test_can_retrieve_presigned_object(self):
-        key_name = 'mykey'
-        self.create_object(key_name=key_name, body='foobar')
-        signer = botocore.auth.S3SigV4QueryAuth(
-            credentials=self.service.session.get_credentials(),
-            region_name='us-east-1', service_name='s3', expires=60)
-        op = self.service.get_operation('GetObject')
-        params = op.build_parameters(bucket=self.bucket_name, key=key_name)
-        request = self.endpoint.create_request(params)
-        signer.add_auth(request.original)
-        presigned_url = request.original.prepare().url
-        # We should now be able to retrieve the contents of 'mykey' using
-        # this presigned url.
-        self.assertEqual(requests.get(presigned_url).content, b'foobar')
+    def setup_bucket(self):
+        self.key = 'myobject'
+        self.bucket_name = self.create_bucket()
+        self.create_object(key_name=self.key)
 
 
-@unittest.skip('Need a method for presigning')
-class TestS3PresignFixHost(BaseS3ClientTest):
-    def test_presign_does_not_change_host(self):
-        endpoint = self.service.get_endpoint('us-west-2')
-        key_name = 'mykey'
-        bucket_name = 'mybucket'
-        signer = botocore.auth.S3SigV4QueryAuth(
-            credentials=self.session.get_credentials(),
-            region_name='us-west-2', service_name='s3', expires=60)
-        op = self.service.get_operation('GetObject')
-        params = op.build_parameters(bucket=bucket_name, key=key_name)
-        request = endpoint.create_request(params)
-        signer.add_auth(request.original)
-        presigned_url = request.original.prepare().url
-        # We should not have rewritten the host to be s3.amazonaws.com.
-        self.assertTrue(presigned_url.startswith(
-            'https://s3-us-west-2.amazonaws.com/mybucket/mykey'),
+class TestS3PresignUsStandard(BaseS3PresignTest):
+    def setUp(self):
+        super(TestS3PresignUsStandard, self).setUp()
+        self.region = 'us-east-1'
+        self.client_config = Config(
+            region_name=self.region, signature_version='s3')
+        self.client = self.session.create_client(
+            's3', config=self.client_config)
+        self.setup_bucket()
+
+    def test_presign_sigv2(self):
+        presigned_url = self.client.generate_presigned_url(
+            'get_object', Params={'Bucket': self.bucket_name, 'Key': self.key})
+        self.assertTrue(
+            presigned_url.startswith(
+                'https://%s.s3.amazonaws.com/%s' % (
+                    self.bucket_name, self.key)),
+            "Host was suppose to use DNS style, instead "
+            "got: %s" % presigned_url)
+        # Try to retrieve the object using the presigned url.
+        self.assertEqual(requests.get(presigned_url).content, b'foo')
+
+    def test_presign_sigv4(self):
+        self.client_config.signature_version = 's3v4'
+        self.client = self.session.create_client(
+            's3', config=self.client_config)
+        presigned_url = self.client.generate_presigned_url(
+            'get_object', Params={'Bucket': self.bucket_name, 'Key': self.key})
+        self.assertTrue(
+            presigned_url.startswith(
+                'https://s3.amazonaws.com/%s/%s' % (
+                    self.bucket_name, self.key)),
+            "Host was suppose to be the us-east-1 endpoint, instead "
+            "got: %s" % presigned_url)
+        # Try to retrieve the object using the presigned url.
+        self.assertEqual(requests.get(presigned_url).content, b'foo')
+
+    def test_presign_post_sigv2(self):
+
+        # Create some of the various supported conditions.
+        conditions = [
+            {"acl": "public-read"},
+        ]
+
+        # Create the fields that follow the policy.
+        fields = {
+            'acl': 'public-read',
+        }
+
+        # Retrieve the args for the presigned post.
+        post_args = self.client.generate_presigned_post(
+            self.bucket_name, self.key, Fields=fields,
+            Conditions=conditions)
+
+        # Make sure that the form can be posted successfully.
+        files = {'file': ('baz', 'some data')}
+
+        # Make sure the correct endpoint is being used
+        self.assertTrue(
+            post_args['url'].startswith(
+                'https://%s.s3.amazonaws.com' % self.bucket_name),
+            "Host was suppose to use DNS style, instead "
+            "got: %s" % post_args['url'])
+
+        # Try to retrieve the object using the presigned url.
+        r = requests.post(
+            post_args['url'], data=post_args['fields'], files=files)
+        self.assertEqual(r.status_code, 204)
+
+    def test_presign_post_sigv4(self):
+        self.client_config.signature_version = 's3v4'
+        self.client = self.session.create_client(
+            's3', config=self.client_config)
+
+        # Create some of the various supported conditions.
+        conditions = [
+            {"acl": 'public-read'},
+        ]
+
+        # Create the fields that follow the policy.
+        fields = {
+            'acl': 'public-read',
+        }
+
+        # Retrieve the args for the presigned post.
+        post_args = self.client.generate_presigned_post(
+            self.bucket_name, self.key, Fields=fields,
+            Conditions=conditions)
+
+        # Make sure that the form can be posted successfully.
+        files = {'file': ('baz', 'some data')}
+
+        # Make sure the correct endpoint is being used
+        self.assertTrue(
+            post_args['url'].startswith(
+                'https://s3.amazonaws.com/%s' % self.bucket_name),
+            "Host was suppose to use us-east-1 endpoint, instead "
+            "got: %s" % post_args['url'])
+
+        r = requests.post(
+            post_args['url'], data=post_args['fields'], files=files)
+        self.assertEqual(r.status_code, 204)
+
+
+class TestS3PresignNonUsStandard(BaseS3PresignTest):
+
+    def setUp(self):
+        super(TestS3PresignNonUsStandard, self).setUp()
+        self.region = 'us-west-2'
+        self.client_config = Config(
+            region_name=self.region, signature_version='s3')
+        self.client = self.session.create_client(
+            's3', config=self.client_config)
+        self.setup_bucket()
+
+    def test_presign_sigv2(self):
+        presigned_url = self.client.generate_presigned_url(
+            'get_object', Params={'Bucket': self.bucket_name, 'Key': self.key})
+        self.assertTrue(
+            presigned_url.startswith(
+                'https://%s.s3.amazonaws.com/%s' % (
+                    self.bucket_name, self.key)),
+            "Host was suppose to use DNS style, instead "
+            "got: %s" % presigned_url)
+        # Try to retrieve the object using the presigned url.
+        self.assertEqual(requests.get(presigned_url).content, b'foo')
+
+    def test_presign_sigv4(self):
+        self.client_config.signature_version = 's3v4'
+        self.client = self.session.create_client(
+            's3', config=self.client_config)
+        presigned_url = self.client.generate_presigned_url(
+            'get_object', Params={'Bucket': self.bucket_name, 'Key': self.key})
+
+        self.assertTrue(
+            presigned_url.startswith(
+                'https://s3-us-west-2.amazonaws.com/%s/%s' % (
+                    self.bucket_name, self.key)),
             "Host was suppose to be the us-west-2 endpoint, instead "
             "got: %s" % presigned_url)
+        # Try to retrieve the object using the presigned url.
+        self.assertEqual(requests.get(presigned_url).content, b'foo')
+
+    def test_presign_post_sigv2(self):
+        # Create some of the various supported conditions.
+        conditions = [
+            {"acl": "public-read"},
+        ]
+
+        # Create the fields that follow the policy.
+        fields = {
+            'acl': 'public-read',
+        }
+
+        # Retrieve the args for the presigned post.
+        post_args = self.client.generate_presigned_post(
+            self.bucket_name, self.key, Fields=fields, Conditions=conditions)
+
+        # Make sure that the form can be posted successfully.
+        files = {'file': ('baz', 'some data')}
+
+        # Make sure the correct endpoint is being used
+        self.assertTrue(
+            post_args['url'].startswith(
+                'https://%s.s3.amazonaws.com' % self.bucket_name),
+            "Host was suppose to use DNS style, instead "
+            "got: %s" % post_args['url'])
+
+        r = requests.post(
+            post_args['url'], data=post_args['fields'], files=files)
+        self.assertEqual(r.status_code, 204)
+
+    def test_presign_post_sigv4(self):
+        self.client_config.signature_version = 's3v4'
+        self.client = self.session.create_client(
+            's3', config=self.client_config)
+
+        # Create some of the various supported conditions.
+        conditions = [
+            {"acl": "public-read"},
+        ]
+
+        # Create the fields that follow the policy.
+        fields = {
+            'acl': 'public-read',
+        }
+
+        # Retrieve the args for the presigned post.
+        post_args = self.client.generate_presigned_post(
+            self.bucket_name, self.key, Fields=fields, Conditions=conditions)
+
+        # Make sure that the form can be posted successfully.
+        files = {'file': ('baz', 'some data')}
+
+        # Make sure the correct endpoint is being used
+        self.assertTrue(
+            post_args['url'].startswith(
+                'https://s3-us-west-2.amazonaws.com/%s' % self.bucket_name),
+            "Host was suppose to use DNS style, instead "
+            "got: %s" % post_args['url'])
+
+        r = requests.post(
+            post_args['url'], data=post_args['fields'], files=files)
+        self.assertEqual(r.status_code, 204)
 
 
 class TestCreateBucketInOtherRegion(TestS3BaseWithBucket):
